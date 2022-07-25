@@ -1,10 +1,12 @@
 import json
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from functools import wraps
 from itertools import count, zip_longest
 from time import perf_counter
 from typing import Dict, List
 
+import distributed
 import requests
 from ape import chain, networks
 from evm_trace import vmtrace
@@ -14,7 +16,6 @@ from msgspec import DecodeError
 from rich import print
 from tqdm import tqdm
 from typer import Typer
-import distributed
 
 app = Typer(pretty_exceptions_show_locals=False)
 
@@ -24,6 +25,15 @@ def timed(label):
     start = perf_counter()
     yield
     print(f"[yellow]{label} took [bold]{perf_counter() - start:.3f}s")
+
+
+def mainnet(f):
+    @wraps(f)
+    def decorator(*args, **kwds):
+        with networks.ethereum.mainnet.use_default_provider():
+            return f(*args, **kwds)
+
+    return decorator
 
 
 class Measure:
@@ -76,6 +86,7 @@ def trace_block(height: int) -> List[vmtrace.VMTrace]:
 
 
 @app.command()
+@mainnet
 def trace(tx: str, verbose: bool = False, address: str = None):
     with timed("total"):
         trace = trace_transaction(tx)
@@ -101,6 +112,7 @@ def trace(tx: str, verbose: bool = False, address: str = None):
 
 
 @app.command("compare")
+@mainnet
 def compare_methods(tx: str, verbose: bool = True, address: str = None):
     # fetch a geth trace and compare with what we calculate from vmtrace
     # exit at the first non-matching frame
@@ -166,6 +178,7 @@ def compare_methods(tx: str, verbose: bool = True, address: str = None):
 
 
 @app.command()
+@mainnet
 def fuzz(compare: bool = True, blocks: int = 100, min_gas_limit: int = 1_000_000):
     c = count(1)
     f = open("compare-failed.txt", "at")
@@ -193,6 +206,7 @@ def fuzz(compare: bool = True, blocks: int = 100, min_gas_limit: int = 1_000_000
 
 
 @app.command()
+@mainnet
 def block_fuzz():
     for height in range(chain.blocks.height, 0, -1):
         print(height)
@@ -225,13 +239,13 @@ def peak_memory(blocks: int = 10):
     with open("peak-memory.jsonl", "wt") as f:
         with networks.ethereum.mainnet.use_default_provider():
             block_range = range(chain.blocks.height - blocks, chain.blocks.height)
-        for future in client.map(measure_block_memory, block_range):
+        for future in tqdm(client.map(measure_block_memory, block_range), total=blocks):
             for result in future.result():
                 f.write(json.dumps(result) + "\n")
 
 
 def measure_block_memory(height):
-    print(f'[green]processing block {height}')
+    print(f"[green]processing block {height}")
     txs = [tx for tx in chain.blocks[height].transactions]
     traces = trace_block(height)
     results = []
