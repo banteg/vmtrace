@@ -1,0 +1,4 @@
+.pytest_cache
+.hypothesis
+.mypy_cache
+.vscode
