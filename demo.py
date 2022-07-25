@@ -247,6 +247,7 @@ def bench(blocks: int = 10):
         res = {'block': height, 'frames': frames, 'traces': len(traces), 'fetch': t2 - t1, 'replay': t3 - t2}
         print(res)
         f.write(json.dumps(res) + '\n')
+        f.flush()
     
     f.close()
 
