@@ -3,6 +3,7 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from itertools import count, zip_longest
 from time import perf_counter
+from typing import Dict, List
 
 import requests
 from ape import chain, networks
@@ -24,31 +25,62 @@ def timed(label):
     print(f"[yellow]{label} took [bold]{perf_counter() - start:.3f}s")
 
 
-def fetch_trace_data(tx) -> bytes:
-    resp = requests.post(
-        chain.provider.uri,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "trace_replayTransaction",
-            "params": [tx, ["vmTrace"]],
-        },
-    )
+class Measure:
+    def __init__(self, label, total=1):
+        self.label = label
+        self.total = total
+
+    def __enter__(self):
+        self.start = perf_counter()
+        return self
+
+    @property
+    def elapsed(self):
+        return perf_counter() - self.start
+
+    @property
+    def rate(self):
+        return self.total / self.elapsed
+
+    def __exit__(self, *args):
+        elapsed = perf_counter() - self.start
+        print(
+            f"[yellow]{self.label} {self.total:,d} took [bold]{elapsed:.3f}s ({self.rate:,.2f}/s)"
+        )
+
+
+def request_raw(method, params) -> bytes:
+    with timed("fetch"):
+        resp = requests.post(
+            chain.provider.uri,  # type: ignore
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        )
+    print(f"[yellow]size={naturalsize(len(resp.content))}")
     return resp.content
+
+
+def trace_transaction(tx: str) -> vmtrace.VMTrace:
+    buffer = request_raw("trace_replayTransaction", [tx, ["vmTrace"]])
+    with timed("decode"):
+        trace: vmtrace.VMTrace = vmtrace.from_rpc_response(buffer)
+    return trace
+
+
+def trace_block(height: int) -> List[vmtrace.VMTrace]:
+    buffer = request_raw("trace_replayBlockTransactions", [hex(height), ["vmTrace"]])
+    with timed("decode"):
+        traces: List[vmtrace.VMTrace] = vmtrace.from_rpc_response(buffer)
+    print(f"[green]found traces={len(traces)}")
+    return traces
 
 
 @app.command()
 def trace(tx: str, verbose: bool = False, address: str = None):
     with timed("total"):
-        with timed("fetch"):
-            resp = fetch_trace_data(tx)
-            print(f"[yellow]trace size: {naturalsize(len(resp))}")
-
-        with timed("decode"):
-            trace = vmtrace.from_rpc_response(resp)
+        trace = trace_transaction(tx)
 
         with timed("replay"):
-            peak_mem = defaultdict(int)
+            peak_mem: Dict[str, int] = defaultdict(int)
             i = 0
             t0 = perf_counter()
             for i, frame in enumerate(
@@ -63,7 +95,7 @@ def trace(tx: str, verbose: bool = False, address: str = None):
 
         print(f"[yellow]{i / (t1 - t0):,.2f} frames/s ({i:,d} frames)")
 
-    print("[bold magenta]peak memory allocated")
+    print("peak memory allocated")
     print(dict(Counter(peak_mem).most_common()))
 
 
@@ -72,14 +104,7 @@ def compare_methods(tx: str, verbose: bool = True, address: str = None):
     # fetch a geth trace and compare with what we calculate from vmtrace
     # exit at the first non-matching frame
     # use `cast run --debug <tx>` for a similarly styled interactive debugger
-    with timed("fetch vmtrace"):
-        vmtrace_frames = vmtrace.to_trace_frames(
-            vmtrace.from_rpc_response(fetch_trace_data(tx)),
-            address=address,
-        )
-    # with timed("fetch geth"):
-    # consume the full iterator to measure how long it takes
-    peak_mem = defaultdict(int)
+    vmtrace_frames = vmtrace.to_trace_frames(trace_transaction(tx), address=address)
     reference_frames = chain.provider.get_transaction_trace(tx)
     i = 0
 
@@ -88,8 +113,6 @@ def compare_methods(tx: str, verbose: bool = True, address: str = None):
             print(f"[bold red]a: pc={a.pc} op={a.op} depth={a.depth}")
             print(f"[bold red]b: pc={b.pc} op={b.op} depth={b.depth}")
             raise ValueError("traced unaligned")
-
-        peak_mem[a.address] = max(peak_mem[a.address], len(a.memory))
 
         stack_a = a.stack
         stack_b = b.stack
@@ -140,9 +163,6 @@ def compare_methods(tx: str, verbose: bool = True, address: str = None):
 
     print(f"[bold green]all good, compared {i} frames")
 
-    print("[bold magenta]peak memory allocated")
-    print(dict(Counter(peak_mem).most_common()))
-
 
 @app.command()
 def fuzz(compare: bool = True, blocks: int = 100, min_gas_limit: int = 1_000_000):
@@ -153,7 +173,7 @@ def fuzz(compare: bool = True, blocks: int = 100, min_gas_limit: int = 1_000_000
         block = chain.blocks[number]
         print(f"[bold yellow]{block.number}")
         for tx in block.transactions:
-            if tx.gas_limit < min_gas_limit:
+            if (tx.gas_limit or 0) < min_gas_limit:
                 continue
             tx_hash = tx.txn_hash.hex()
             print(f"{next(c)}. {tx_hash}")
@@ -173,41 +193,17 @@ def fuzz(compare: bool = True, blocks: int = 100, min_gas_limit: int = 1_000_000
 
 @app.command()
 def block_fuzz():
-    for number in range(chain.blocks.height, 0, -1):
-        print(number)
+    for height in range(chain.blocks.height, 0, -1):
+        print(height)
         with timed("[red]total"):
-            with timed("fetch"):
-                resp = requests.post(
-                    chain.provider.uri,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "trace_replayBlockTransactions",
-                        "params": [hex(number), ["vmTrace"]],
-                    },
-                )
-                print(f"[green]response size={naturalsize(len(resp.content))}")
+            traces = trace_block(height)
 
-            with timed("decode"):
-                vmtraces = vmtrace.from_rpc_response(resp.content, is_list=True)
-                print(f"[green]found traces={len(vmtraces)}")
-
-            with timed("replay"):
+            with Measure("replay") as measure:
                 t0 = perf_counter()
-                frames = 0
-                for trace in vmtraces:
+                measure.total = 0
+                for trace in traces:
                     for frame in vmtrace.to_trace_frames(trace, copy_memory=False):
-                        frames += 1
-                print(
-                    f"[green]replay speed={frames / (perf_counter() - t0):,.2f} frames/s"
-                )
-
-
-@app.command()
-def save(tx: str):
-    data = fetch_trace_data(tx)
-    with open(f"vmtrace-{tx}.json", "wt") as f:
-        f.write(json.dumps(json.loads(data)["result"]["vmTrace"], indent=2))
+                        measure.total += 1
 
 
 if __name__ == "__main__":
