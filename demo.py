@@ -226,6 +226,32 @@ class WorkerConnection(distributed.WorkerPlugin):
         networks.ethereum.mainnet.use_default_provider().__enter__()
 
 
+
+
+@app.command()
+@mainnet
+def bench(blocks: int = 10):
+    t0 = perf_counter()
+    f = open('bench.jsonl', 'wt')
+    for height in range(chain.blocks.height - blocks, chain.blocks.height):
+        print(height)
+        frames = 0
+        t1 = perf_counter()
+        traces = trace_block(height)
+        t2 = perf_counter()
+        for trace in traces:
+            for frame in vmtrace.to_trace_frames(trace, copy_memory=False):
+                frames += 1
+        t3 = perf_counter()
+
+        res = {'block': height, 'frames': frames, 'traces': len(traces), 'fetch': t2 - t1, 'replay': t3 - t2}
+        print(res)
+        f.write(json.dumps(res) + '\n')
+    
+    f.close()
+
+
+
 @app.command()
 def peak_memory(blocks: int = 10):
     """
