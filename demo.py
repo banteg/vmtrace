@@ -14,6 +14,7 @@ from msgspec import DecodeError
 from rich import print
 from tqdm import tqdm
 from typer import Typer
+import distributed
 
 app = Typer(pretty_exceptions_show_locals=False)
 
@@ -206,6 +207,49 @@ def block_fuzz():
                         measure.total += 1
 
 
+class WorkerConnection(distributed.WorkerPlugin):
+    def setup(self, worker):
+        networks.ethereum.mainnet.use_default_provider().__enter__()
+
+
+@app.command()
+def peak_memory(blocks: int = 10):
+    """
+    Measure peak memory usage fetching multiple blocks in parallel with dask.
+    """
+    cluster = distributed.LocalCluster(n_workers=16)
+    client = distributed.Client(cluster)
+    client.register_worker_plugin(WorkerConnection())
+    print(client.dashboard_link)
+
+    with open("peak-memory.jsonl", "wt") as f:
+        with networks.ethereum.mainnet.use_default_provider():
+            block_range = range(chain.blocks.height - blocks, chain.blocks.height)
+        for future in client.map(measure_block_memory, block_range):
+            for result in future.result():
+                f.write(json.dumps(result) + "\n")
+
+
+def measure_block_memory(height):
+    print(f'[green]processing block {height}')
+    txs = [tx for tx in chain.blocks[height].transactions]
+    traces = trace_block(height)
+    results = []
+    for tx, trace in zip(txs, traces):
+        peak_mem: Dict[str, int] = defaultdict(int)
+        for frame in vmtrace.to_trace_frames(
+            trace, address=tx.receiver, copy_memory=False
+        ):
+            peak_mem[frame.address] = max(peak_mem[frame.address], len(frame.memory))
+        if peak_mem:
+            res = {
+                "block_number": height,
+                "tx": tx.txn_hash.hex(),
+                "peak_mem": dict(Counter(peak_mem).most_common()),
+            }
+            results.append(res)
+    return results
+
+
 if __name__ == "__main__":
-    with networks.ethereum.mainnet.use_default_provider():
-        app()
+    app()

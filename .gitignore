@@ -2,3 +2,5 @@
 .hypothesis
 .mypy_cache
 .vscode
+dask-worker-space
+*.jsonl
